@@ -41,12 +41,6 @@ SELECTED_LAYERS: tuple[int, ...] = (-9, -5, -1)
 """~62%, ~83%, ~100% depth — the band where truthfulness signal peaks."""
 
 
-def _last_real_position(attention_mask: torch.Tensor) -> int:
-    """Return the index of the last non-padding token."""
-    real_idx = attention_mask.nonzero(as_tuple=False).flatten()
-    return int(real_idx[-1].item())
-
-
 def _response_token_indices(attention_mask: torch.Tensor) -> torch.Tensor:
     """Return indices of tokens belonging to the assistant response.
 
@@ -120,33 +114,35 @@ def extract_logit_features(
         # Too short — return zeros as fallback.
         return torch.zeros(10, dtype=logits.dtype)
 
-    # Align logits with the tokens that were actually chosen.
-    # logits[t] is the distribution for predicting token[t+1].
-    # We use logits[t] and compare with input_ids[t+1].
-    resp_idx_aligned = resp_idx[:-1]  # drop last (no target token after it)
-    if len(resp_idx_aligned) < 1:
+    # Align logits with the tokens they predict.
+    # For a causal LM, logits[t] predicts input_ids[t+1].
+    # So to get the confidence for response token at position p,
+    # we need logits[p-1].  We use positions resp_idx - 1.
+    logit_positions = resp_idx - 1
+    # Ensure all positions are within the logits range.
+    valid = logit_positions >= 0
+    if valid.sum() < 1:
         return torch.zeros(10, dtype=logits.dtype)
 
-    target_ids = input_ids[resp_idx[1:]]  # tokens at positions resp_idx[1:]
-    resp_logits = logits[resp_idx_aligned]  # logits predicting those tokens
+    target_ids = input_ids[resp_idx[valid]]  # the actual response tokens
+    resp_logits = logits[logit_positions[valid]]  # logits predicting those tokens
 
     # Softmax → probabilities
-    probs = F.softmax(resp_logits, dim=-1)  # (n_resp, vocab_size)
+    probs = F.softmax(resp_logits, dim=-1)  # (n_valid, vocab_size)
 
     # Probability of the token that was actually chosen
-    chosen_probs = probs.gather(1, target_ids.unsqueeze(-1)).squeeze(-1)  # (n_resp,)
-    chosen_log_probs = torch.log(chosen_probs + 1e-10)  # (n_resp,)
+    chosen_probs = probs.gather(1, target_ids.unsqueeze(-1)).squeeze(-1)  # (n_valid,)
+    chosen_log_probs = torch.log(chosen_probs + 1e-10)  # (n_valid,)
 
     # Top-1 and top-2 probabilities → margin
     topk = torch.topk(probs, 2, dim=-1)
-    top1_prob = topk.values[:, 0]  # (n_resp,)
-    top2_prob = topk.values[:, 1]  # (n_resp,)
-    margin = top1_prob - top2_prob  # (n_resp,)
+    top1_prob = topk.values[:, 0]  # (n_valid,)
+    top2_prob = topk.values[:, 1]  # (n_valid,)
+    margin = top1_prob - top2_prob  # (n_valid,)
 
     # Entropy of the full vocabulary distribution at each step
-    # Using logsumexp trick for numerical stability
     log_probs_all = F.log_softmax(resp_logits, dim=-1)
-    entropy = -(torch.exp(log_probs_all) * log_probs_all).sum(dim=-1)  # (n_resp,)
+    entropy = -(torch.exp(log_probs_all) * log_probs_all).sum(dim=-1)  # (n_valid,)
 
     # Aggregate into per-sequence scalars
     n_resp = float(len(chosen_probs))

@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import numpy as np
 import torch.nn as nn
-from sklearn.decomposition import PCA
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
@@ -54,7 +53,6 @@ LR_C = 1.0
 LR_MAX_ITER = 3000
 
 VARIANCE_THRESHOLD = 0.01
-PCA_COMPONENTS = 64
 SEED = 42
 
 
