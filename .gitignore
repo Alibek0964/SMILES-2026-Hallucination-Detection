@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.ipynb_checkpoints/
+.DS_Store
+
+# Local-only file — do not ship in the final submission.
+HOW_TO_RUN.md
