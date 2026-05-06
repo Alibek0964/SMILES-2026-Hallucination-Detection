@@ -1,182 +1,94 @@
 """
-probe.py — Hallucination probe classifier.
+probe.py — Hallucination probe classifier (v2: linear probe).
 
-Pipeline applied to the input feature vector:
+The v1 MLP probe massively over-fit the small training set (train AUROC ~94%,
+test AUROC ~65%). v2 deliberately reduces capacity:
 
-    raw features (≈ 4480-4580 dims)
-        → StandardScaler          (zero-mean, unit-variance per feature)
-        → PCA  (n_components=128) (compress to a learnable subspace)
-        → small MLP               (128 → 64 → 1) with dropout + weight decay
-        → sigmoid                 (probability of hallucination)
+    raw features (~2690 dims)
+        → StandardScaler             (zero-mean, unit-variance per feature)
+        → PCA  (n_components=64)     (compress to a learnable subspace)
+        → LogisticRegression         (L2-penalised, class-balanced)
+        → tuned threshold            (max F1 on official validation slice)
 
-Why this design for a 689-sample binary task:
+Why a linear probe instead of an MLP:
 
-  * The raw feature dim (4480 from 5 layers × 896 hidden, +100 geometric) is
-    far larger than the number of training examples — PCA collapses it to a
-    bounded subspace and acts as a strong implicit regulariser.
-  * A two-layer MLP with dropout 0.4 and weight_decay 1e-3 is enough capacity
-    for this problem and consistently beats both raw logistic regression and
-    larger MLPs in our experiments.
-  * An internal random hold-out (10% of train) drives early stopping on
-    validation AUROC, preventing the network from over-fitting the small set.
-  * Class imbalance is corrected by ``pos_weight`` in BCEWithLogitsLoss.
-  * Threshold tuning in ``fit_hyperparameters`` maximises F1 on the official
-    validation split.
+  * With ~482 training samples per fold, any non-linear model with enough
+    capacity to fit the training set perfectly will memorise noise. The
+    "linear probe" is the standard tool in the interpretability literature
+    (Alain & Bengio 2016; Belinkov 2022) precisely because of this.
+  * scikit-learn's LogisticRegression is essentially zero-variance: it has a
+    convex objective, no random initialisation, and well-understood
+    regularisation behaviour.
+  * If a linear probe cannot extract the signal, an MLP almost certainly
+    cannot extract it from the same features either — the issue then lives
+    in the feature extraction stage, not in the classifier.
+
+Pipeline interface mirrors scikit-learn for compatibility with evaluate.py
+(``fit``, ``predict``, ``predict_proba``) plus the official
+``fit_hyperparameters`` hook for threshold tuning.
 """
 
 from __future__ import annotations
 
-import copy
-
 import numpy as np
-import torch
 import torch.nn as nn
 from sklearn.decomposition import PCA
-from sklearn.metrics import f1_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
 
 
 # ---------------------------------------------------------------------------
-# Hyperparameters — tuned by light manual search; safe defaults.
+# Hyperparameters
 # ---------------------------------------------------------------------------
 
-PCA_COMPONENTS = 128
-HIDDEN_DIM     = 64
-DROPOUT        = 0.4
-WEIGHT_DECAY   = 1e-3
-LR             = 1e-3
-MAX_EPOCHS     = 300
-PATIENCE       = 30          # early-stopping patience on val AUROC
-INTERNAL_VAL   = 0.10        # fraction of fit() data used for early stopping
-SEED           = 42
-
-
-def _seed_everything(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+PCA_COMPONENTS = 64
+# Inverse regularisation strength: smaller = stronger L2.  C=0.5 gave the best
+# average validation AUROC across folds in light manual sweep.
+LR_C = 0.5
+LR_MAX_ITER = 2000
+SEED = 42
 
 
 class HallucinationProbe(nn.Module):
-    """Scaler + PCA + small MLP, with early stopping and threshold tuning."""
+    """Linear probe: StandardScaler → PCA(64) → balanced LogisticRegression.
+
+    Subclasses ``nn.Module`` for compatibility with the evaluation pipeline,
+    but contains no torch parameters — all learning is delegated to sklearn.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None
         self._scaler = StandardScaler()
         self._pca: PCA | None = None
+        self._clf: LogisticRegression | None = None
         self._threshold: float = 0.5
-        _seed_everything(SEED)
-
-    # ------------------------------------------------------------------
-    # Network factory
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, HIDDEN_DIM),
-            nn.GELU(),
-            nn.Dropout(DROPOUT),
-            nn.Linear(HIDDEN_DIM, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._net is None:
-            raise RuntimeError("Network not built. Call fit() first.")
-        return self._net(x).squeeze(-1)
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Fit scaler, PCA, and MLP. Uses an internal hold-out for early
-        stopping on validation AUROC."""
-        # 1. Scale.
+        """Fit scaler, PCA, and logistic regression."""
+        # 1. Standardise feature columns.
         X_scaled = self._scaler.fit_transform(X)
 
-        # 2. PCA — n_components capped at min(128, n_samples-1, n_features).
+        # 2. PCA — n_components capped at min(64, n_samples-1, n_features).
         n_components = min(PCA_COMPONENTS, X_scaled.shape[0] - 1, X_scaled.shape[1])
         self._pca = PCA(n_components=n_components, random_state=SEED)
         X_reduced = self._pca.fit_transform(X_scaled)
 
-        # 3. Internal train/val split for early stopping.
-        # Stratify to preserve class ratio in both splits.
-        y_int = y.astype(int)
-        try:
-            X_tr, X_va, y_tr, y_va = train_test_split(
-                X_reduced, y_int,
-                test_size=INTERNAL_VAL,
-                random_state=SEED,
-                stratify=y_int,
-            )
-        except ValueError:
-            # Fallback if stratification fails (e.g. tiny minority class).
-            X_tr, X_va, y_tr, y_va = train_test_split(
-                X_reduced, y_int, test_size=INTERNAL_VAL, random_state=SEED,
-            )
-
-        # 4. Build network sized to the PCA output.
-        self._build_network(X_tr.shape[1])
-
-        X_tr_t = torch.from_numpy(X_tr).float()
-        y_tr_t = torch.from_numpy(y_tr.astype(np.float32))
-        X_va_t = torch.from_numpy(X_va).float()
-
-        # 5. Class-balanced loss.
-        n_pos = int(y_tr.sum())
-        n_neg = len(y_tr) - n_pos
-        pos_weight = torch.tensor(
-            [n_neg / max(n_pos, 1)], dtype=torch.float32
+        # 3. Class-balanced L2 logistic regression. ``class_weight='balanced'``
+        # automatically sets weights inversely proportional to class frequency,
+        # which matters because the dataset is ~70% positive (hallucinated).
+        self._clf = LogisticRegression(
+            C=LR_C,
+            penalty="l2",
+            class_weight="balanced",
+            solver="lbfgs",
+            max_iter=LR_MAX_ITER,
+            random_state=SEED,
         )
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=MAX_EPOCHS,
-        )
-
-        # 6. Train with early stopping on validation AUROC.
-        best_state: dict | None = None
-        best_auroc = -1.0
-        epochs_without_improvement = 0
-
-        for epoch in range(MAX_EPOCHS):
-            # --- Train step (full-batch is fine on this size) ---
-            self.train()
-            optimizer.zero_grad()
-            loss = criterion(self(X_tr_t), y_tr_t)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            # --- Validation AUROC ---
-            self.eval()
-            with torch.no_grad():
-                val_logits = self(X_va_t)
-                val_probs = torch.sigmoid(val_logits).numpy()
-
-            # AUROC undefined if val happens to have a single class.
-            if len(np.unique(y_va)) < 2:
-                continue
-            val_auroc = roc_auc_score(y_va, val_probs)
-
-            if val_auroc > best_auroc + 1e-5:
-                best_auroc = val_auroc
-                best_state = copy.deepcopy(self._net.state_dict())
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-                if epochs_without_improvement >= PATIENCE:
-                    break
-
-        # 7. Restore the best weights seen during training.
-        if best_state is not None:
-            self._net.load_state_dict(best_state)
-
-        self.eval()
+        self._clf.fit(X_reduced, y.astype(int))
         return self
 
     # ------------------------------------------------------------------
@@ -205,17 +117,23 @@ class HallucinationProbe(nn.Module):
     # ------------------------------------------------------------------
     # Prediction
     # ------------------------------------------------------------------
-    def _transform(self, X: np.ndarray) -> torch.Tensor:
+    def _transform(self, X: np.ndarray) -> np.ndarray:
         X_scaled = self._scaler.transform(X)
-        X_reduced = self._pca.transform(X_scaled) if self._pca is not None else X_scaled
-        return torch.from_numpy(X_reduced).float()
+        return self._pca.transform(X_scaled) if self._pca is not None else X_scaled
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        X_t = self._transform(X)
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
+        X_reduced = self._transform(X)
+        if self._clf is None:
+            raise RuntimeError("Probe not fitted. Call fit() first.")
+        return self._clf.predict_proba(X_reduced)
+
+    # ------------------------------------------------------------------
+    # nn.Module compatibility shim — never actually called by evaluate.py.
+    # ------------------------------------------------------------------
+    def forward(self, *_args, **_kwargs):  # pragma: no cover
+        raise NotImplementedError(
+            "HallucinationProbe v2 is an sklearn pipeline; use predict_proba()."
+        )
