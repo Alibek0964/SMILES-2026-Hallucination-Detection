@@ -74,10 +74,15 @@ N_ALIGNMENT_FEATURES = 12  # see assemble order at the bottom of extract_alignme
 
 # ---------------------------------------------------------------------------
 # Ablation switch: drop hidden-state pool, keep only alignment features.
-# v7 (full)        : 2688 hidden + 12 alignment = 2700 dims  →  77.17 % test AUROC
-# v7 (alignment-only):              12 alignment = 12 dims  →  ?  ← this run
+# Empirically validated on this dataset:
+#   v7-full        (2688 hidden + 12 alignment = 2700 dims): test AUROC 77.17 %
+#   v7-ablation    (              12 alignment =   12 dims): test AUROC 73.59 %
+# Hidden states add +3.6 % AUROC at the cost of train-AUROC inflating from
+# 86 % → 99.9 % (i.e. they are memorised, not generalised).  We keep them in
+# the final submission because the contest's primary metric is AUROC, but the
+# alignment-only result is the more elegant scientific finding.
 # ---------------------------------------------------------------------------
-INCLUDE_HIDDEN_STATES: bool = False
+INCLUDE_HIDDEN_STATES: bool = True
 
 
 # ---------------------------------------------------------------------------
