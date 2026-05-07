@@ -1,28 +1,18 @@
 """
-probe.py — Hallucination probe classifier (v5: Regularization + PCA).
+probe.py — Hallucination probe classifier (v6: No PCA, XGBoost with balancing).
 
-v5 fixes the massive overfitting seen in v4 (Train AUROC 100% vs Test 69%).
-
-Pipeline:
-    raw features (~2700 dims: 3×896 hidden + 10 logits)
-        → StandardScaler
-        → PCA  (n_components=96)   ← Critical: compresses noisy hidden states
-        → XGBoost (max_depth=2, strong reg)
-
-Key changes vs v4:
-  1. Added PCA(96) to compress 2700 dims → 96 dims.
-     This removes noise from hidden states that XGBoost was memorizing.
-  2. Reduced XGBoost capacity: max_depth=2 (was 3).
-  3. Increased L1/L2 regularization (5.0).
-  4. Reduced n_estimators to 100 (was 200) to prevent memorization.
+v6 rolls back the destructive PCA from v5 (which dropped AUROC to 66.2%).
+Instead, we keep the full feature space (2698 dims) but improve generalization via:
+  1. Removing PCA completely (preserves logits signal).
+  2. Adding `scale_pos_weight` to XGBoost to handle 70% hallucinated imbalance.
+  3. Conservative tree depth (3) + moderate regularization (1.0).
+  4. Increased n_estimators (300) with lower learning rate (0.05).
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch.nn as nn
-from sklearn.decomposition import PCA
-from sklearn.feature_selection import VarianceThreshold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
@@ -35,36 +25,31 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Hyperparameters — tuned to PREVENT overfitting
+# Hyperparameters
 # ---------------------------------------------------------------------------
 
-# PCA dimensionality
-PCA_COMPONENTS = 96
-
-# XGBoost parameters — Conservative to avoid memorizing the 482 samples.
-XGB_N_ESTIMATORS = 150
-XGB_MAX_DEPTH = 2            # Very shallow trees
-XGB_LEARNING_RATE = 0.05     # Slower learning
-XGB_REG_ALPHA = 10.0         # Strong L1 penalty
-XGB_REG_LAMBDA = 10.0        # Strong L2 penalty
-XGB_SUBSAMPLE = 0.7          # Use only 70% of data per tree
-XGB_COLSAMPLE_BYTREE = 0.7   # Use only 70% of features per tree
-XGB_MIN_CHILD_WEIGHT = 10    # Require more samples to split a node
+# XGBoost parameters
+XGB_N_ESTIMATORS = 300
+XGB_MAX_DEPTH = 3
+XGB_LEARNING_RATE = 0.05
+XGB_REG_ALPHA = 1.0
+XGB_REG_LAMBDA = 1.0
+XGB_SUBSAMPLE = 0.8
+XGB_COLSAMPLE_BYTREE = 0.8
 
 # LogisticRegression fallback
-LR_C = 0.1  # Stronger regularization
+LR_C = 1.0
 LR_MAX_ITER = 3000
 
 SEED = 42
 
 
 class HallucinationProbe(nn.Module):
-    """Classifier: StandardScaler → PCA(96) → XGBoost (or LogReg)."""
+    """Classifier: StandardScaler → XGBoost (balanced) or LogReg."""
 
     def __init__(self) -> None:
         super().__init__()
         self._scaler = StandardScaler()
-        self._pca: PCA | None = None
         self._clf: XGBClassifier | LogisticRegression | None = None
         self._threshold: float = 0.5
         self._use_xgb = HAS_XGBOOST
@@ -73,17 +58,16 @@ class HallucinationProbe(nn.Module):
     # Training
     # ------------------------------------------------------------------
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Fit scaler, PCA, and classifier."""
+        """Fit scaler and classifier."""
         # 1. Standardise feature columns.
         X_scaled = self._scaler.fit_transform(X)
 
-        # 2. PCA — compress to remove noise from hidden states.
-        n_components = min(PCA_COMPONENTS, X_scaled.shape[0] - 1, X_scaled.shape[1])
-        self._pca = PCA(n_components=n_components, random_state=SEED)
-        X_reduced = self._pca.fit_transform(X_scaled)
-
         if self._use_xgb:
-            # 3a. XGBoost with conservative settings.
+            # Compute scale_pos_weight to handle 70/30 imbalance
+            n_neg = np.sum(y == 0)
+            n_pos = np.sum(y == 1)
+            spw = n_neg / max(n_pos, 1)
+
             self._clf = XGBClassifier(
                 n_estimators=XGB_N_ESTIMATORS,
                 max_depth=XGB_MAX_DEPTH,
@@ -92,14 +76,13 @@ class HallucinationProbe(nn.Module):
                 reg_lambda=XGB_REG_LAMBDA,
                 subsample=XGB_SUBSAMPLE,
                 colsample_bytree=XGB_COLSAMPLE_BYTREE,
-                min_child_weight=XGB_MIN_CHILD_WEIGHT,
+                scale_pos_weight=spw,
                 eval_metric="auc",
                 random_state=SEED,
                 verbosity=0,
             )
-            self._clf.fit(X_reduced, y.astype(int))
+            self._clf.fit(X_scaled, y.astype(int))
         else:
-            # 3b. LogisticRegression fallback.
             self._clf = LogisticRegression(
                 C=LR_C,
                 penalty="l2",
@@ -108,7 +91,7 @@ class HallucinationProbe(nn.Module):
                 max_iter=LR_MAX_ITER,
                 random_state=SEED,
             )
-            self._clf.fit(X_reduced, y.astype(int))
+            self._clf.fit(X_scaled, y.astype(int))
 
         return self
 
@@ -139,8 +122,7 @@ class HallucinationProbe(nn.Module):
     # Prediction
     # ------------------------------------------------------------------
     def _transform(self, X: np.ndarray) -> np.ndarray:
-        X_scaled = self._scaler.transform(X)
-        return self._pca.transform(X_scaled) if self._pca is not None else X_scaled
+        return self._scaler.transform(X)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
@@ -156,5 +138,5 @@ class HallucinationProbe(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, *_args, **_kwargs):  # pragma: no cover
         raise NotImplementedError(
-            "HallucinationProbe v5 delegates to sklearn/xgboost; use predict_proba()."
+            "HallucinationProbe v6 delegates to sklearn/xgboost; use predict_proba()."
         )
