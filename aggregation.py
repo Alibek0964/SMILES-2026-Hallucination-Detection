@@ -172,7 +172,11 @@ def extract_alignment_features(
     context_idx, response_idx = _split_context_response(input_ids, attention_mask)
 
     if len(context_idx) == 0 or len(response_idx) == 0:
-        return torch.zeros(N_ALIGNMENT_FEATURES, dtype=hidden_states.dtype)
+        return torch.zeros(
+            N_ALIGNMENT_FEATURES,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
     context_idx = context_idx.to(hidden_states.device)
     response_idx = response_idx.to(hidden_states.device)
@@ -267,6 +271,7 @@ def extract_alignment_features(
             norm_resp_len,      # 11
         ],
         dtype=hidden_states.dtype,
+        device=hidden_states.device,    # match agg's device for downstream torch.cat
     )
     assert features.shape[0] == N_ALIGNMENT_FEATURES
     return features
@@ -287,7 +292,11 @@ def extract_geometric_features(
     necessary inputs are available; otherwise returns zeros so the pipeline
     keeps running."""
     if input_ids is None:
-        return torch.zeros(N_ALIGNMENT_FEATURES, dtype=hidden_states.dtype)
+        return torch.zeros(
+            N_ALIGNMENT_FEATURES,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
     return extract_alignment_features(
         hidden_states, input_ids, attention_mask, last_layer_attentions
     )
@@ -333,6 +342,8 @@ def aggregation_and_feature_extraction(
         attention_mask,
         last_layer_attentions,
     ) if input_ids is not None else torch.zeros(
-        N_ALIGNMENT_FEATURES, dtype=hidden_states.dtype
+        N_ALIGNMENT_FEATURES,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
     return torch.cat([agg, align], dim=0)
