@@ -72,6 +72,13 @@ most informative for both content (early-mid) and decision (late) layers."""
 
 N_ALIGNMENT_FEATURES = 12  # see assemble order at the bottom of extract_alignment_features
 
+# ---------------------------------------------------------------------------
+# Ablation switch: drop hidden-state pool, keep only alignment features.
+# v7 (full)        : 2688 hidden + 12 alignment = 2700 dims  →  77.17 % test AUROC
+# v7 (alignment-only):              12 alignment = 12 dims  →  ?  ← this run
+# ---------------------------------------------------------------------------
+INCLUDE_HIDDEN_STATES: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Context / response splitting
@@ -331,9 +338,17 @@ def aggregation_and_feature_extraction(
         1-D feature tensor.  Length = 2688 (hidden state pool) + 12 alignment
         features when use_geometric=True, else just 2688.
     """
-    agg = aggregate(hidden_states, attention_mask, input_ids=input_ids)
+    if INCLUDE_HIDDEN_STATES:
+        agg = aggregate(hidden_states, attention_mask, input_ids=input_ids)
+    else:
+        # Ablation: skip hidden-state pool entirely. Keep only alignment.
+        agg = None
 
     if not use_geometric:
+        # Even without geometric, we still need *some* features.  In ablation
+        # mode without alignment that would be empty; fall back to aggregate.
+        if agg is None:
+            agg = aggregate(hidden_states, attention_mask, input_ids=input_ids)
         return agg
 
     align = extract_alignment_features(
@@ -346,4 +361,8 @@ def aggregation_and_feature_extraction(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+
+    if agg is None:
+        # Alignment-only ablation: just the 12-dim feature vector.
+        return align
     return torch.cat([agg, align], dim=0)
