@@ -7,3 +7,8 @@ __pycache__/
 
 # Local-only file — do not ship in the final submission.
 HOW_TO_RUN.md
+
+_v13_features.pkl
+_v12_features.pkl
+_consistency_cache.pkl
+*.pkl.tmp
